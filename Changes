@@ -1,0 +1,5 @@
+Revision history for Perl extension Faster
+ 
+0.01  Thu Mar  9 05:38:46 CET 2006
+	- original version; cloned from Convert::Scalar
+
