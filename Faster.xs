@@ -32,7 +32,7 @@ faster_entersub (pTHX)
 
           // only simple cv calls for now
           if (!PL_perldb && !PL_tainting
-              && SvTYPE (sv) == SVt_PVCV && !CvXSUB (sv)
+              && SvTYPE (sv) == SVt_PVCV && !CvISXSUB (sv)
               && CvSTART (sv) // must exist
               && CvSTART (sv)->op_type != OP_NULL) // shield against compiling an already-compiled op
             {

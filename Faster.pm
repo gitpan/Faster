@@ -10,27 +10,36 @@ Faster - do some things faster
 
 =head1 DESCRIPTION
 
-This module implements a very simple-minded JIT. It works by more or less
-translating every function it sees into a C program, compiling it and then
-replacing the function by the compiled code.
+This module implements a very simple-minded "JIT" (or actually AIT, ahead
+of time compiler). It works by more or less translating every function it
+sees into a C program, compiling it and then replacing the function by the
+compiled code.
 
 As a result, startup times are immense, as every function might lead to a
 full-blown compilation.
 
 The speed improvements are also not great, you can expect 20% or so on
-average, for code that runs very often.
+average, for code that runs very often. The reason for this is that data
+handling is mostly being done by the same old code, it just gets called
+a bit faster. Regexes and string operations won't get faster. Airhtmetic
+doresn't become any faster. Just the operands and other stuff is put on
+the stack faster, and the opcodes themselves have a bit less overhead.
 
 Faster is in the early stages of development. Due to its design its
 relatively safe to use (it will either work or simply slowdown the program
 immensely, but rarely cause bugs).
 
+More intelligent algorithms (loop optimisation, type inference) could
+improve that easily, but requires a much more elaborate presentation and
+optimiser than what is in place. There are no plans to improve Faster in
+this way, yet, but it would provide a reasonably good place to start.
+
 Usage is very easy, just C<use Faster> and every function called from then
 on will be compiled.
 
-Right now, Faster will leave lots of F<*.c>, F<*.o> and F<*.so> files in
-your F<$FASTER_CACHEDIR> (by default F<$HOME/.perl-faster-cache>), and it
-will even create those temporary files in an insecure manner, so watch
-out.
+Right now, Faster can leave lots of F<*.c> and F<*.so> files in your
+F<$FASTER_CACHEDIR> (by default F<$HOME/.perl-faster-cache>), and it will
+even create those temporary files in an insecure manner, so watch out.
 
 =over 4
 
@@ -49,7 +58,7 @@ use Storable ();
 use Fcntl ();
 
 BEGIN {
-   our $VERSION = '0.01';
+   our $VERSION = '0.1';
 
    require XSLoader;
    XSLoader::load __PACKAGE__, $VERSION;
@@ -65,7 +74,7 @@ my $CACHEDIR =
 
 my $COMPILE = "$Config{cc} -c -I$Config{archlibexp}/CORE $Config{optimize} $Config{ccflags} $Config{cccdlflags}";
 my $LINK    = "$Config{ld} $Config{ldflags} $Config{lddlflags} $Config{ccdlflags}";
-my $LIBS    = "$Config{libs}";
+my $LIBS    = "";
 my $_o      = $Config{_o};
 my $_so     = ".so";
 
@@ -73,7 +82,7 @@ my $_so     = ".so";
 $COMPILE =~ s/-f(?:PIC|pic)//g
    if $Config{archname} =~ /^(i[3456]86)-/;
 
-my $opt_assert = $ENV{FASTER_DEBUG};
+my $opt_assert = $ENV{FASTER_DEBUG} & 2;
 my $verbose    = $ENV{FASTER_VERBOSE}+0;
 
 warn "Faster: CACHEDIR is $CACHEDIR\n" if $verbose > 2;
@@ -84,7 +93,6 @@ our @ops;
 our $insn;
 our $op;
 our $op_name;
-our @op_loop;
 our %op_regcomp;
 
 # ops that cause immediate return to the interpreter
@@ -147,21 +155,22 @@ my %f_noasync = map +($_ => undef), qw(
    mapstart grepstart match entereval
    enteriter entersub leaveloop
 
-   pushmark nextstate
+   pushmark nextstate caller
 
    const stub unstack
-   last next redo seq
+   last next redo goto seq
    padsv padav padhv padany
    aassign sassign orassign
    rv2av rv2cv rv2gv rv2hv refgen
    gv gvsv
    add subtract multiply divide
    complement cond_expr and or not
+   bit_and bit_or bit_xor
    defined
    method method_named bless
    preinc postinc predec postdec
    aelem aelemfast helem delete exists
-   pushre subst list join split concat
+   pushre subst list lslice join split concat
    length substr stringify ord
    push pop shift unshift
    eq ne gt lt ge le
@@ -185,6 +194,11 @@ sub assert {
 sub out_callop {
    assert "nextop == (OP *)$$op";
    $source .= "  PL_op = nextop; nextop = " . (callop $op) . ";\n";
+}
+
+sub out_jump {
+   assert "nextop == (OP *)${$_[0]}L";
+   $source .= "  goto op_${$_[0]};\n";
 }
 
 sub out_cond_jump {
@@ -227,7 +241,7 @@ sub op_nextstate {
 }
 
 sub op_pushmark {
-   $source .= "  PUSHMARK (PL_stack_sp);\n";
+   $source .= "  faster_PUSHMARK (PL_stack_sp);\n";
 
    out_next;
 }
@@ -487,15 +501,22 @@ sub op_substcont {
 sub out_break_op {
    my ($idx) = @_;
 
-   out_callop;
-
-   out_cond_jump $_->[$idx]
-      for reverse @op_loop;
-
-   $source .= "  return nextop;\n";
+   if ($op->flags & B::OPf_SPECIAL && $insn->{loop}) {
+      # common case: no label, innermost loop only
+      my $next = $insn->{loop}{loop_targ}[$idx];
+      out_callop;
+      out_jump $next;
+   } elsif (my $loop = $insn->{loop}) {
+      # less common case: maybe break to some outer loop
+      $source .= "  return nextop;\n";
+      # todo: walk stack up
+   } else {
+      # fuck yourself for writing such hacks
+      $source .= "  return nextop;\n";
+   }
 }
 
-sub xop_next {
+sub op_next {
    out_break_op 0;
 }
 
@@ -503,29 +524,41 @@ sub op_last {
    out_break_op 1;
 }
 
-sub xop_redo {
-   out_break_op 2;
-}
+# TODO: does not seem to work
+#sub op_redo {
+#   out_break_op 2;
+#}
 
 sub cv2c {
    my ($cv) = @_;
 
    local @ops;
-   local @op_loop;
    local %op_regcomp;
 
-   my %opsseen;
+   my $curloop;
    my @todo = $cv->START;
    my %op_target;
+   my $numpushmark;
+   my $scope;
 
+   my %op_seen;
    while (my $op = shift @todo) {
-      for (; $$op; $op = $op->next) {
-         last if $opsseen{$$op}++;
+      my $next;
+      for (; $$op; $op = $next) {
+         last if $op_seen{$$op}++;
+
+         $next = $op->next;
 
          my $name = $op->name;
          my $class = B::class $op;
 
          my $insn = { op => $op };
+
+         # end of loop reached?
+         $curloop = $curloop->{loop} if $curloop && $$op == ${$curloop->{loop_targ}[1]};
+
+         # remember enclosing loop
+         $insn->{loop} = $curloop if $curloop;
 
          push @ops, $insn;
 
@@ -535,8 +568,8 @@ sub cv2c {
             $insn->{extend} = $extend if defined $extend;
          }
 
-         push @todo, $op->next;
-
+         # TODO: mark scopes similar to loops, make them comparable
+         # static cxstack(?)
          if ($class eq "LOGOP") {
             push @todo, $op->other;
             $op_target{${$op->other}}++;
@@ -554,14 +587,26 @@ sub cv2c {
             }
 
          } elsif ($class eq "LOOP") {
-            my @targ = ($op->nextop, $op->lastop->next, $op->redoop->next);
+            my @targ = ($op->nextop, $op->lastop->next, $op->redoop);
 
-            push @op_loop, \@targ;
-            push @todo, @targ;
+            unshift @todo, $next, $op->redoop, $op->nextop, $op->lastop;
+            $next = $op->redoop;
 
             $op_target{$$_}++ for @targ;
+
+            $insn->{loop_targ} = \@targ;
+            $curloop = $insn;
+
          } elsif ($class eq "COP") {
-            $insn->{bblock}++ if defined $op->label;
+            if (defined $op->label) {
+               $insn->{bblock}++;
+               $curloop->{contains_label}{$op->label}++ if $curloop; #TODO: should be within loop
+            }
+
+         } else {
+            if ($name eq "pushmark") {
+               $numpushmark++;
+            }
          }
       }
    }
@@ -573,6 +618,9 @@ OP *%%%FUNC%%% (pTHX)
 {
   register OP *nextop = (OP *)${$ops[0]->{op}}L;
 EOF
+
+   $source .= "  faster_PUSHMARK_PREALLOC ($numpushmark);\n"
+      if $numpushmark;
 
    while (@ops) {
       $insn = shift @ops;
@@ -683,6 +731,14 @@ sub func2ptr {
 #include "perl.h"
 #include "XSUB.h"
 
+#if 1
+# define faster_PUSHMARK_PREALLOC(count) while (PL_markstack_ptr + (count) >= PL_markstack_max) markstack_grow ()
+# define faster_PUSHMARK(p) *++PL_markstack_ptr = (p) - PL_stack_base
+#else
+# define faster_PUSHMARK_PREALLOC(count) 1
+# define faster_PUSHMARK(p) PUSHMARK(p)
+#endif
+
 #define RUNOPS_TILL(op)						\\
   while (nextop != (op))					\\
     {								\\
@@ -703,7 +759,7 @@ EOF
 
       close $fh;
       system "$COMPILE -o $stem$_o $stem.c";
-      unlink "$stem.c";
+      unlink "$stem.c" unless $ENV{FASTER_DEBUG} & 1;
       system "$LINK -o $stem$_so $stem$_o $LIBS";
       unlink "$stem$_o";
    }
@@ -803,8 +859,8 @@ function is compiled into which shared object.
 =item FASTER_DEBUG
 
 Add debugging code when set to values higher than C<0>. Currently, this
-adds 1-3 C<assert>'s per perl op, to ensure that opcode order and C
-execution order are compatible.
+adds 1-3 C<assert>'s per perl op (FASTER_DEBUG > 1), to ensure that opcode
+order and C execution order are compatible.
 
 =item FASTER_CACHE
 
@@ -838,6 +894,7 @@ executed function as soon as they are being encountered during execution.
 
  goto
  next, redo (but not well-behaved last's)
+ labels, if used
  eval
  require
  any use of formats
